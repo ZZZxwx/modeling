@@ -703,6 +703,111 @@ def test_modeller_uses_pipeline_step_time_for_schedule_adjustments():
     assert report.bubble_fraction == pytest.approx(expected_bubble)
 
 
+def test_graph_pipeline_ep_overlap_hides_ep_a2a_in_pp_stage():
+    """Graph-native PP modelling applies spec-style EP A2A masking."""
+    import pytest
+    from zrt.transform.analysis.training import TrainingPipelinePass
+
+    hw = _hw()
+    hidden = TensorMeta.from_shape_dtype("hidden", (1, 16, 32), DType.BF16)
+    nodes: dict[str, OpNode] = {}
+    edges: list[Edge] = []
+
+    def _node(
+        node_id: str,
+        *,
+        latency_us: float,
+        stage_id: int,
+        phase: str = "fwd",
+        op_type: str = "aten.mm.default",
+        category: str = "compute",
+        scope: str = "model.layers.0.mlp",
+        role: str | None = None,
+    ) -> OpNode:
+        n = OpNode(
+            id=node_id,
+            op_type=op_type,
+            inputs=[hidden],
+            outputs=[hidden],
+            attrs={"collective": "all_to_all", "group_size": 4, "role": role} if role else {},
+            scope=scope,
+            category=category,
+            layer=str(stage_id),
+        )
+        n.annotations["latency_us"] = latency_us
+        n.annotations["stage_id"] = stage_id
+        n.annotations["phase"] = phase
+        n.annotations["stream_id"] = 1 if category == "communication" else 0
+        n.annotations["stream_type"] = "comm" if category == "communication" else "compute"
+        if category == "communication":
+            n.annotations["inserted_by"] = "ep_pass"
+        if "expert" in scope:
+            n.annotations["ep_needs_a2a"] = True
+        nodes[node_id] = n
+        return n
+
+    stage0 = [
+        _node("s0_non_ep", latency_us=40.0, stage_id=0, scope="model.layers.0.self_attn"),
+        _node(
+            "s0_dispatch", latency_us=80.0, stage_id=0, op_type="comm.all_to_all",
+            category="communication", role="dispatch",
+        ),
+        _node("s0_expert", latency_us=100.0, stage_id=0, scope="model.layers.0.moe.experts.0"),
+        _node(
+            "s0_combine", latency_us=80.0, stage_id=0, op_type="comm.all_to_all",
+            category="communication", role="combine",
+        ),
+    ]
+    stage1 = [
+        _node("s1_non_ep", latency_us=40.0, stage_id=1, scope="model.layers.1.self_attn"),
+        _node(
+            "s1_dispatch", latency_us=80.0, stage_id=1, op_type="comm.all_to_all",
+            category="communication", role="dispatch",
+        ),
+        _node("s1_expert", latency_us=100.0, stage_id=1, scope="model.layers.1.moe.experts.0"),
+        _node(
+            "s1_combine", latency_us=80.0, stage_id=1, op_type="comm.all_to_all",
+            category="communication", role="combine",
+        ),
+    ]
+    for stage_nodes in (stage0, stage1):
+        for src, dst in zip(stage_nodes, stage_nodes[1:]):
+            edges.append(Edge(src=src.id, src_idx=0, dst=dst.id, dst_idx=0, tensor=hidden))
+
+    g = OpGraph(
+        name="ep_overlap_graph",
+        phase="train",
+        nodes=nodes,
+        edges=edges,
+        metadata={"num_layers": 2, "num_layers_traced": 2, "training_flops": 1e9},
+    )
+
+    ctx_base = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(pp=2, ep=4),
+        training=TrainingConfig(micro_batch=1, global_batch=4, pp_schedule="dualpipe"),
+    )
+    ctx_overlap = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(pp=2, ep=4),
+        training=TrainingConfig(
+            micro_batch=1,
+            global_batch=4,
+            pp_schedule="dualpipe",
+            ep_overlap=True,
+            ep_overlap_waves=4,
+        ),
+    )
+
+    base = TrainingPipelinePass().run(g, ctx_base).metadata["pipeline_metrics"]
+    overlapped_graph = TrainingPipelinePass().run(g, ctx_overlap)
+    overlapped = overlapped_graph.metadata["pipeline_metrics"]
+
+    assert overlapped.step_time_ms < base.step_time_ms
+    assert overlapped.hidden_comm_ms > 0.0
+    assert overlapped_graph.metadata["ep_hidden_us"] == pytest.approx(75.0 * 2)
+
+
 # ── Phase 2 end-to-end: stitched pp>1 ─────────────────────────────────────────
 
 def test_pp_routing_basic():

@@ -587,6 +587,17 @@ class TrainingPipelinePass(GraphPass):
                 stage_bwd[s] = per_stage_bwd
                 stage_bwd_dw[s] = 0.0
 
+        ep_overlap_by_stage = self._apply_ep_overlap_to_stage_timelines(
+            g, ctx, stage_fwd, stage_bwd, pp
+        )
+        if ep_overlap_by_stage:
+            g.metadata["stage_timelines_fwd"] = dict(stage_fwd)
+            g.metadata["stage_timelines_bwd"] = dict(stage_bwd)
+            g.metadata["stage_ep_hidden_us"] = dict(ep_overlap_by_stage["hidden"])
+            g.metadata["stage_ep_exposed_us"] = dict(ep_overlap_by_stage["exposed"])
+            g.metadata["ep_hidden_us"] = sum(ep_overlap_by_stage["hidden"].values())
+            g.metadata["ep_exposed_us"] = sum(ep_overlap_by_stage["exposed"].values())
+
         # ── Delegate to PipelineComposer ──────────────────────────────────
         from python.zrt.training.compose.stage import StageTime
         from python.zrt.training.compose.schedules import (
@@ -606,6 +617,14 @@ class TrainingPipelinePass(GraphPass):
                 bwd=stage_bwd.get(s, 0.0) / 1e6,
                 bwd_dx=(stage_bwd.get(s, 0.0) - stage_bwd_dw.get(s, 0.0)) / 1e6,
                 bwd_dw=stage_bwd_dw.get(s, 0.0) / 1e6,
+                ep_hidden=(
+                    ep_overlap_by_stage.get("hidden", {}).get(s, 0.0) / 1e6
+                    if ep_overlap_by_stage else 0.0
+                ),
+                ep_exposed=(
+                    ep_overlap_by_stage.get("exposed", {}).get(s, 0.0) / 1e6
+                    if ep_overlap_by_stage else 0.0
+                ),
             )
             for s in range(pp)
         ]
@@ -688,8 +707,10 @@ class TrainingPipelinePass(GraphPass):
             step_time_ms = step_time_us / 1000.0
 
         exposed_comm_ms = total_exposed_us / 1000.0
-        hidden_comm_ms = hidden_us / 1000.0
-        total_comm_ms = total_comm_us / 1000.0
+        ep_hidden_us = sum(ep_overlap_by_stage["hidden"].values()) if ep_overlap_by_stage else 0.0
+        ep_total_us = sum(ep_overlap_by_stage["total"].values()) if ep_overlap_by_stage else 0.0
+        hidden_comm_ms = (hidden_us + ep_hidden_us) / 1000.0
+        total_comm_ms = (total_comm_us + ep_total_us) / 1000.0
 
         warmup_steps = step_result.warmup_steps
         cooldown_steps = step_result.cooldown_steps
@@ -1019,6 +1040,86 @@ class TrainingPipelinePass(GraphPass):
         imbalance_factors = {2: 1.05, 4: 1.10, 8: 1.15, 16: 1.20}
         return imbalance_factors.get(ep, 1.15)
 
+    @staticmethod
+    def _apply_ep_overlap_to_stage_timelines(
+        g: "OpGraph",
+        ctx: "TransformContext",
+        stage_fwd: dict[int, float],
+        stage_bwd: dict[int, float],
+        pp: int,
+    ) -> dict[str, dict[int, float]]:
+        """Apply spec-style EP A2A masking to graph-native PP stage timings."""
+        training = ctx.training
+        ep = ctx.parallel.ep if ctx.parallel else 1
+        if training is None or not training.ep_overlap or ep <= 1:
+            return {}
+
+        hw_compute = getattr(ctx.hw_spec, "compute", None)
+        hardware_waves = int(getattr(hw_compute, "ep_overlap_waves", 0))
+        waves = int(training.ep_overlap_waves or hardware_waves)
+
+        hidden: dict[int, float] = {}
+        exposed: dict[int, float] = {}
+        total: dict[int, float] = {}
+
+        for stage_id in range(pp):
+            ep_fwd = ep_bwd = gemm_fwd = gemm_bwd = 0.0
+            compute_fwd = compute_bwd = 0.0
+            for node in g.nodes.values():
+                if node.annotations.get("stage_id", 0) != stage_id:
+                    continue
+                phase = node.annotations.get("phase", "fwd")
+                is_bwd = phase in _BWD_PHASES
+                latency = float(node.annotations.get("latency_us", 0.0))
+                if node.category == "communication" and _is_ep_a2a_node(node):
+                    if is_bwd:
+                        ep_bwd += latency
+                    else:
+                        ep_fwd += latency
+                    continue
+                if node.category != "communication":
+                    if is_bwd:
+                        compute_bwd += latency
+                    else:
+                        compute_fwd += latency
+                    if _is_graph_routed_expert_compute(node):
+                        if is_bwd:
+                            gemm_bwd += latency
+                        else:
+                            gemm_fwd += latency
+
+            saved_fwd = _wave_overlap_saved_us(ep_fwd, gemm_fwd, waves) if waves > 0 else 0.0
+            saved_bwd = _wave_overlap_saved_us(ep_bwd, gemm_bwd, waves) if waves > 0 else 0.0
+
+            if training.dualbatch and pp > 1:
+                residual_fwd = max(0.0, ep_fwd - saved_fwd)
+                residual_bwd = max(0.0, ep_bwd - saved_bwd)
+                non_ep_fwd = max(0.0, compute_fwd - gemm_fwd)
+                non_ep_bwd = max(0.0, compute_bwd - gemm_bwd)
+
+                inter_fwd = min(residual_fwd, non_ep_fwd)
+                inter_bwd = min(residual_bwd, non_ep_bwd)
+
+                V = max(1, int(getattr(training, "vpp_chunks", 1)))
+                M = max(1, int(getattr(training, "num_microbatches", 1)))
+                bubble_slots = (pp - 1) / (2.0 * V)
+                steady_fraction = M / (M + bubble_slots) if M + bubble_slots > 0 else 1.0
+                saved_fwd += inter_fwd * steady_fraction
+                saved_bwd += inter_bwd * steady_fraction
+
+            saved_fwd = min(saved_fwd, ep_fwd, stage_fwd.get(stage_id, 0.0))
+            saved_bwd = min(saved_bwd, ep_bwd, stage_bwd.get(stage_id, 0.0))
+            if saved_fwd > 0:
+                stage_fwd[stage_id] = max(0.0, stage_fwd.get(stage_id, 0.0) - saved_fwd)
+            if saved_bwd > 0:
+                stage_bwd[stage_id] = max(0.0, stage_bwd.get(stage_id, 0.0) - saved_bwd)
+
+            hidden[stage_id] = saved_fwd + saved_bwd
+            total[stage_id] = ep_fwd + ep_bwd
+            exposed[stage_id] = max(0.0, total[stage_id] - hidden[stage_id])
+
+        return {"hidden": hidden, "exposed": exposed, "total": total}
+
 
 # ── Exposed comm-time helper ────────────────────────────────────────────────────
 
@@ -1053,3 +1154,33 @@ def compute_exposed_comm_time(
         return exposed_per_round * cp_rounds
     else:
         return comm_latency_us
+
+
+def _is_ep_a2a_node(node) -> bool:
+    if node.op_type != "comm.all_to_all":
+        return False
+    role = str(node.attrs.get("role", "")).lower()
+    return node.annotations.get("inserted_by") == "ep_pass" or role in {"dispatch", "combine"}
+
+
+def _is_graph_routed_expert_compute(node) -> bool:
+    if node.op_type == "mega_moe":
+        return False
+    scope = (node.scope or "").lower()
+    if "shared_expert" in scope or "shared.expert" in scope:
+        return False
+    if node.annotations.get("grouped_mm_role"):
+        return True
+    if node.op_type == "GroupedMatMul":
+        return "moe" in scope or "expert" in scope
+    return "experts." in scope or "expert_" in scope or ".experts[" in scope or "moe_ffn" in scope
+
+
+def _wave_overlap_saved_us(comm_us: float, gemm_us: float, waves: int) -> float:
+    if comm_us <= 0.0 or gemm_us <= 0.0 or waves <= 0:
+        return 0.0
+    comm_per_wave = comm_us / waves
+    gemm_per_wave = gemm_us / waves
+    exposed_per_wave = max(comm_per_wave - gemm_per_wave, 0.0)
+    exposed_total = comm_per_wave + (waves - 1) * exposed_per_wave
+    return max(0.0, comm_us - exposed_total)

@@ -95,6 +95,9 @@ class TrainingConfig:
     # Pipeline schedule
     pp_schedule: str = "1f1b"  # "1f1b", "interleaved", "dualpipe", "dualpipev", "zb"
     vpp_chunks: int = 1
+    ep_overlap: bool = False
+    ep_overlap_waves: int = 0
+    dualbatch: bool = False
 
     # Optional explicit layer→stage assignment for PP; length must equal
     # the number of traced transformer layers.  None → greedy bin-packing.
