@@ -703,12 +703,7 @@ def test_modeller_uses_pipeline_step_time_for_schedule_adjustments():
     assert report.bubble_fraction == pytest.approx(expected_bubble)
 
 
-def test_graph_pipeline_ep_overlap_hides_ep_a2a_in_pp_stage():
-    """Graph-native PP modelling applies spec-style EP A2A masking."""
-    import pytest
-    from zrt.transform.analysis.training import TrainingPipelinePass
-
-    hw = _hw()
+def _ep_overlap_stage_graph(*, phase="fwd", non_ep_us=40.0):
     hidden = TensorMeta.from_shape_dtype("hidden", (1, 16, 32), DType.BF16)
     nodes: dict[str, OpNode] = {}
     edges: list[Edge] = []
@@ -747,40 +742,53 @@ def test_graph_pipeline_ep_overlap_hides_ep_a2a_in_pp_stage():
         return n
 
     stage0 = [
-        _node("s0_non_ep", latency_us=40.0, stage_id=0, scope="model.layers.0.self_attn"),
+        _node("s0_non_ep", latency_us=non_ep_us, stage_id=0, phase=phase,
+              scope="model.layers.0.self_attn"),
         _node(
-            "s0_dispatch", latency_us=80.0, stage_id=0, op_type="comm.all_to_all",
-            category="communication", role="dispatch",
+            "s0_dispatch", latency_us=80.0, stage_id=0, phase=phase,
+            op_type="comm.all_to_all", category="communication", role="dispatch",
         ),
-        _node("s0_expert", latency_us=100.0, stage_id=0, scope="model.layers.0.moe.experts.0"),
+        _node("s0_expert", latency_us=100.0, stage_id=0, phase=phase,
+              scope="model.layers.0.moe.experts.0"),
         _node(
-            "s0_combine", latency_us=80.0, stage_id=0, op_type="comm.all_to_all",
-            category="communication", role="combine",
+            "s0_combine", latency_us=80.0, stage_id=0, phase=phase,
+            op_type="comm.all_to_all", category="communication", role="combine",
         ),
     ]
     stage1 = [
-        _node("s1_non_ep", latency_us=40.0, stage_id=1, scope="model.layers.1.self_attn"),
+        _node("s1_non_ep", latency_us=non_ep_us, stage_id=1, phase=phase,
+              scope="model.layers.1.self_attn"),
         _node(
-            "s1_dispatch", latency_us=80.0, stage_id=1, op_type="comm.all_to_all",
-            category="communication", role="dispatch",
+            "s1_dispatch", latency_us=80.0, stage_id=1, phase=phase,
+            op_type="comm.all_to_all", category="communication", role="dispatch",
         ),
-        _node("s1_expert", latency_us=100.0, stage_id=1, scope="model.layers.1.moe.experts.0"),
+        _node("s1_expert", latency_us=100.0, stage_id=1, phase=phase,
+              scope="model.layers.1.moe.experts.0"),
         _node(
-            "s1_combine", latency_us=80.0, stage_id=1, op_type="comm.all_to_all",
-            category="communication", role="combine",
+            "s1_combine", latency_us=80.0, stage_id=1, phase=phase,
+            op_type="comm.all_to_all", category="communication", role="combine",
         ),
     ]
     for stage_nodes in (stage0, stage1):
         for src, dst in zip(stage_nodes, stage_nodes[1:]):
             edges.append(Edge(src=src.id, src_idx=0, dst=dst.id, dst_idx=0, tensor=hidden))
 
-    g = OpGraph(
+    return OpGraph(
         name="ep_overlap_graph",
         phase="train",
         nodes=nodes,
         edges=edges,
         metadata={"num_layers": 2, "num_layers_traced": 2, "training_flops": 1e9},
     )
+
+
+def test_graph_pipeline_ep_overlap_hides_ep_a2a_in_pp_stage():
+    """Graph-native PP modelling applies spec-style EP A2A masking."""
+    import pytest
+    from zrt.transform.analysis.training import TrainingPipelinePass
+
+    hw = _hw()
+    g = _ep_overlap_stage_graph()
 
     ctx_base = TransformContext(
         hw_spec=hw,
@@ -806,6 +814,86 @@ def test_graph_pipeline_ep_overlap_hides_ep_a2a_in_pp_stage():
     assert overlapped.step_time_ms < base.step_time_ms
     assert overlapped.hidden_comm_ms > 0.0
     assert overlapped_graph.metadata["ep_hidden_us"] == pytest.approx(75.0 * 2)
+
+
+def test_graph_pipeline_dualbatch_hides_residual_ep_a2a():
+    """dualbatch hides residual EP A2A with non-EP compute after K-wave masking."""
+    import pytest
+    from zrt.transform.analysis.training import TrainingPipelinePass
+
+    hw = _hw()
+    g = _ep_overlap_stage_graph(non_ep_us=40.0)
+
+    ctx_overlap = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(pp=2, ep=4),
+        training=TrainingConfig(
+            micro_batch=1, global_batch=4, pp_schedule="dualpipe",
+            ep_overlap=True, ep_overlap_waves=4,
+        ),
+    )
+    ctx_dualbatch = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(pp=2, ep=4),
+        training=TrainingConfig(
+            micro_batch=1, global_batch=4, pp_schedule="dualpipe",
+            ep_overlap=True, ep_overlap_waves=4, dualbatch=True,
+        ),
+    )
+
+    overlap_graph = TrainingPipelinePass().run(g, ctx_overlap)
+    dualbatch_graph = TrainingPipelinePass().run(g, ctx_dualbatch)
+
+    assert dualbatch_graph.metadata["ep_hidden_us"] > overlap_graph.metadata["ep_hidden_us"]
+    assert dualbatch_graph.metadata["pipeline_metrics"].step_time_ms < (
+        overlap_graph.metadata["pipeline_metrics"].step_time_ms
+    )
+
+
+def test_graph_pipeline_ep_overlap_masks_bwd_phase_a2a():
+    """Backward EP A2A is masked independently from forward timing."""
+    import pytest
+    from zrt.transform.analysis.training import TrainingPipelinePass
+
+    hw = _hw()
+    g = _ep_overlap_stage_graph(phase="bwd")
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(pp=2, ep=4),
+        training=TrainingConfig(
+            micro_batch=1, global_batch=4, pp_schedule="dualpipe",
+            ep_overlap=True, ep_overlap_waves=4,
+        ),
+    )
+
+    result = TrainingPipelinePass().run(g, ctx)
+
+    assert result.metadata["ep_hidden_us"] == pytest.approx(75.0 * 2)
+    # EP imbalance is applied before overlap: 300us * 1.10 - 75us hidden.
+    assert result.metadata["stage_timelines_bwd"][0] == pytest.approx(255.0)
+    assert result.metadata["stage_timelines_fwd"][0] == pytest.approx(0.0)
+
+
+def test_graph_pipeline_dualpipe_dualbatch_defaults_ep_overlap_on():
+    """dualpipe + dualbatch enables graph EP overlap even when ep_overlap is false."""
+    import pytest
+    from zrt.transform.analysis.training import TrainingPipelinePass
+
+    hw = _hw()
+    g = _ep_overlap_stage_graph(non_ep_us=40.0)
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(pp=2, ep=4),
+        training=TrainingConfig(
+            micro_batch=1, global_batch=4, pp_schedule="dualpipe",
+            ep_overlap_waves=4, dualbatch=True,
+        ),
+    )
+
+    result = TrainingPipelinePass().run(g, ctx)
+
+    assert result.metadata["ep_hidden_us"] > 0.0
+    assert result.metadata["pipeline_metrics"].hidden_comm_ms > 0.0
 
 
 # ── Phase 2 end-to-end: stitched pp>1 ─────────────────────────────────────────

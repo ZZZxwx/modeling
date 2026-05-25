@@ -1051,7 +1051,7 @@ class TrainingPipelinePass(GraphPass):
         """Apply spec-style EP A2A masking to graph-native PP stage timings."""
         training = ctx.training
         ep = ctx.parallel.ep if ctx.parallel else 1
-        if training is None or not training.ep_overlap or ep <= 1:
+        if training is None or not _effective_ep_overlap_enabled(training) or ep <= 1:
             return {}
 
         hw_compute = getattr(ctx.hw_spec, "compute", None)
@@ -1161,6 +1161,13 @@ def _is_ep_a2a_node(node) -> bool:
         return False
     role = str(node.attrs.get("role", "")).lower()
     return node.annotations.get("inserted_by") == "ep_pass" or role in {"dispatch", "combine"}
+
+
+def _effective_ep_overlap_enabled(training) -> bool:
+    if getattr(training, "ep_overlap", False):
+        return True
+    schedule = str(getattr(training, "pp_schedule", "")).lower()
+    return schedule == "dualpipe" and bool(getattr(training, "dualbatch", False))
 
 
 def _is_graph_routed_expert_compute(node) -> bool:
