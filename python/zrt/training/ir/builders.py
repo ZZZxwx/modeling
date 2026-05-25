@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from zrt.training.ir.training_graph import Graph, Op, Tensor
+from zrt.training.models.mega_moe import infer_quant_variant
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import Strategy
@@ -448,7 +449,7 @@ def _build_indexer_ops(model: ModelSpec, layer_id: int, seq: int,
 
 def _build_moe_ffn_ops(model: ModelSpec, layer_id: int, seq: int,
                        prefix: str, layer_kind: LayerKind,
-                       act_dtype: Dtype) -> list[Op]:
+                       act_dtype: Dtype, strategy: Strategy) -> list[Op]:
     """MoE FFN: router + shared expert + routed experts + aggregation."""
     h = model.hidden
     ops: list[Op] = []
@@ -510,28 +511,55 @@ def _build_moe_ffn_ops(model: ModelSpec, layer_id: int, seq: int,
             layer_id=layer_id, layer_kind=layer_kind, component="shared_expert"))
 
     # Routed expert FFN (single op with fwd_multiplier)
-    ops.append(Op(name=f"{prefix}.routed_expert_ffn", kind="matmul",
-        inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
-        outputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
-        meta={"m": seq, "n": h, "k": model.moe_ffn,
-              "fwd_multiplier": 3 * model.top_k,
-              "swiglu_clamp": model.swiglu_clamp,
-              "fused_weight_dims": True},
-        layer_id=layer_id, layer_kind=layer_kind, component="routed_expert"))
+    routed_ffn_out_dtype = act_dtype
+    if strategy.mega_moe:
+        moe_act_dtype = model.effective_moe_act_dtype()
+        ops.append(Op(name=f"{prefix}.mega_moe", kind="mega_moe",
+            inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
+            outputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
+            meta={"m": seq, "n": h, "k": model.moe_ffn,
+                  "micro_batch": strategy.micro_batch,
+                  "num_experts": model.num_experts,
+                  "top_k": model.top_k,
+                  "requested_waves": strategy.mega_moe_waves,
+                  "act_bytes": act_dtype.bytes,
+                  "out_bytes": act_dtype.bytes,
+                  "moe_act_bytes": moe_act_dtype.bytes,
+                  "moe_act_dtype": moe_act_dtype,
+                  "weight_bytes": model.routed_expert_compute_dtype.bytes,
+                  "weight_stored_bytes": model.routed_expert_weight_dtype.stored_bytes,
+                  "quant_variant": infer_quant_variant(model),
+                  "fwd_multiplier": 3 * model.top_k,
+                  "swiglu_clamp": model.swiglu_clamp,
+                  "fused_dispatch_compute_combine": True},
+            layer_id=layer_id, layer_kind=layer_kind, component="routed_expert"))
+    else:
+        ops.append(Op(name=f"{prefix}.routed_expert_ffn", kind="matmul",
+            inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
+            outputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
+            meta={"m": seq, "n": h, "k": model.moe_ffn,
+                  "fwd_multiplier": 3 * model.top_k,
+                  "swiglu_clamp": model.swiglu_clamp,
+                  "fused_weight_dims": True},
+            layer_id=layer_id, layer_kind=layer_kind, component="routed_expert"))
 
     # Expert aggregation
     if model.n_shared_experts > 0:
         ops.append(Op(name=f"{prefix}.expert_agg", kind="add",
             inputs=[_tensor("shared_ffn_out", (seq, h), act_dtype),
-                    _tensor("routed_ffn_out", (seq, h), act_dtype)],
+                    _tensor("routed_ffn_out", (seq, h), routed_ffn_out_dtype)],
             outputs=[_tensor("ffn_out", (seq, h), act_dtype)],
-            meta={"bytes_fwd": seq * h * act_dtype.bytes * 3},
+            meta={"bytes_fwd": seq * h * (
+                act_dtype.bytes + routed_ffn_out_dtype.bytes + act_dtype.bytes
+            )},
             layer_id=layer_id, layer_kind=layer_kind, component="routed_expert"))
     else:
         ops.append(Op(name=f"{prefix}.expert_agg", kind="add",
-            inputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
+            inputs=[_tensor("routed_ffn_out", (seq, h), routed_ffn_out_dtype)],
             outputs=[_tensor("ffn_out", (seq, h), act_dtype)],
-            meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
+            meta={"bytes_fwd": seq * h * (
+                routed_ffn_out_dtype.bytes + act_dtype.bytes
+            )},
             layer_id=layer_id, layer_kind=layer_kind, component="routed_expert"))
 
     return ops
@@ -728,6 +756,7 @@ def _moe_block(
     hc_mult: int = 1,
     hc_sinkhorn_iters: int = 20,
     model: ModelSpec | None = None,
+    strategy: Strategy | None = None,
 ) -> list[Op]:
     """Build ops for one MoE transformer block."""
     use_hc = hc_mult > 1
@@ -841,7 +870,8 @@ def _moe_block(
     # ── MoE FFN ────────────────────────────────────────────────────────
     if model is not None:
         ops.extend(_build_moe_ffn_ops(model, layer_id, seq, prefix,
-                                       LayerKind.MOE, moe_act))
+                                       LayerKind.MOE, moe_act,
+                                       strategy or Strategy()))
     else:
         # Legacy path
         ops.append(Op(
@@ -959,6 +989,7 @@ def _mtp_block(
     hc_mult: int = 1,
     hc_sinkhorn_iters: int = 20,
     model: ModelSpec | None = None,
+    strategy: Strategy | None = None,
 ) -> list[Op]:
     """Build ops for one MTP block: embedding projection + transformer block."""
     prefix = f"L{layer_id}"
@@ -981,7 +1012,7 @@ def _mtp_block(
             seq=seq, num_heads=num_heads, num_kv_heads=num_kv_heads,
             head_dim=head_dim, layer_id=layer_id, act_dtype=act_dtype,
             hc_mult=hc_mult, hc_sinkhorn_iters=hc_sinkhorn_iters,
-            model=model,
+            model=model, strategy=strategy,
         )
     else:
         block_ops = dense_block(
@@ -1089,7 +1120,7 @@ def build_graph(model: ModelSpec, strategy: Strategy) -> Graph:
                 seq=s, num_heads=model.num_heads, num_kv_heads=model.num_kv_heads,
                 head_dim=model.head_dim, layer_id=i, act_dtype=act_dtype,
                 hc_mult=hc_mult, hc_sinkhorn_iters=hc_iters,
-                model=model,
+                model=model, strategy=strategy,
             )
         elif lk == LayerKind.MTP:
             block_ops = _mtp_block(
@@ -1097,7 +1128,7 @@ def build_graph(model: ModelSpec, strategy: Strategy) -> Graph:
                 num_heads=model.num_heads, num_kv_heads=model.num_kv_heads,
                 head_dim=model.head_dim, layer_id=i, act_dtype=act_dtype,
                 hc_mult=hc_mult, hc_sinkhorn_iters=hc_iters,
-                model=model,
+                model=model, strategy=strategy,
             )
         else:
             raise ValueError(f"Unknown LayerKind: {lk}")

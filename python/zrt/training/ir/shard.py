@@ -475,6 +475,9 @@ def _insert_ep_collectives(
         for i in range(start, end):
             op = graph.ops[i]
 
+            if op.kind == "mega_moe":
+                continue
+
             # A2A before routed expert FFN
             if op.kind == "matmul" and "routed_expert" in op.name:
                 collectives.append(Collective(
@@ -510,7 +513,18 @@ def _apply_tp_sharding(
     for i in range(start, end):
         op = graph.ops[i]
 
-        if op.kind == "matmul":
+        if op.kind == "mega_moe":
+            k = op.meta.get("k", 0)
+            n = op.meta.get("n", 0)
+            if k > 0:
+                op.meta["k_local"] = k // shard.tp
+            if n > 0:
+                n_local = n // shard.tp
+                op.meta["n_local"] = n_local
+                for t in op.outputs:
+                    if t.shape_logical and t.shape_logical[-1] == n:
+                        t.shape_local = (t.shape_logical[0], n_local)
+        elif op.kind == "matmul":
             m = op.meta.get("m", 0)
             n = op.meta.get("n", 0)
             k = op.meta.get("k", 0)
@@ -660,7 +674,10 @@ def _apply_cp_sharding(
                 if t.shape_logical[0] == seq:
                     t.shape_local = (max(1, t.shape_local[0] // shard.cp),) + t.shape_local[1:]
 
-        if op.kind == "matmul":
+        if op.kind == "mega_moe":
+            if "m" in op.meta:
+                op.meta["m"] = op.meta["m"] // shard.cp
+        elif op.kind == "matmul":
             # For meta-authoritative matmuls (grouped/fused where meta k != input shape),
             # _matmul_cost reads m from meta — must divide it here.
             meta_k = op.meta.get("k", 0)
@@ -757,6 +774,15 @@ def _apply_ep_sharding(
         # compose/stage.py via _ep_parallel_fraction.
         if op.kind == "matmul" and "routed_expert" in op.name:
             pass  # intentionally left unscaled — see comment above
+
+        if op.kind == "mega_moe":
+            num_experts = op.meta.get("num_experts", 0)
+            if num_experts % shard.ep != 0:
+                raise ValueError(
+                    f"num_experts({num_experts}) not divisible by EP({shard.ep})"
+                )
+            op.meta["ep"] = shard.ep
+            op.meta["experts_per_rank"] = num_experts // shard.ep
 
         # Router output: num_experts -> experts_per_rank
         if op.kind == "matmul" and "router" in op.name:

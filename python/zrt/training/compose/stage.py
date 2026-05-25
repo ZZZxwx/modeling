@@ -16,6 +16,7 @@ from zrt.training.io.perf_tables import (
 from zrt.training.models.comm import collective_time, tier_for_group, total_comm_time
 from zrt.training.topology import CommDomain
 from zrt.training.models.flops import OpCost, op_cost
+from zrt.training.models.mega_moe import mega_moe_stage_time
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import Strategy, TPOverlap
@@ -199,6 +200,9 @@ def stage_time(
     t_fwd = 0.0
     t_bwd_dx = 0.0
     t_bwd_dw = 0.0
+    t_fused_ep_comm_fwd = 0.0
+    t_fused_ep_comm_bwd = 0.0
+    t_fused_ep_hidden = 0.0
 
     for op in stage_ops:
         cost = op_cost(op, model, system)
@@ -210,6 +214,16 @@ def stage_time(
         t_fwd    += fwd_t
         t_bwd_dx += dx_t
         t_bwd_dw += dw_t
+        if op.kind == "mega_moe":
+            mega_time = mega_moe_stage_time(
+                op, model, system, strategy, gpu,
+                fwd_compute_s=fwd_t,
+                dx_compute_s=dx_t,
+                dw_compute_s=dw_t,
+            )
+            t_fused_ep_comm_fwd += mega_time.comm_fwd_s
+            t_fused_ep_comm_bwd += mega_time.comm_bwd_s
+            t_fused_ep_hidden += mega_time.ep_hidden_s
 
     # Recompute: re-do forward for selected ops before backward. Returned
     # as a SEPARATE field — NOT folded into ``t_bwd_dx`` — because schedule
@@ -304,25 +318,26 @@ def stage_time(
     t_fwd += t_comm_fwd
     t_bwd_dx += t_comm_bwd
 
+    ep_imbalance = 1.0
     if strategy.ep > 1 and model.num_experts > 0:
         has_moe = any(op.layer_kind == LayerKind.MOE for op in stage_ops)
         if has_moe:
-            imb = ep_imbalance_factor(model.num_experts, strategy.ep,
-                                       getattr(model, 'top_k', 1))
+            ep_imbalance = ep_imbalance_factor(model.num_experts, strategy.ep,
+                                               getattr(model, 'top_k', 1))
             # Apply imbalance only to EP-parallel fraction (routed expert FFN ops)
             # Non-EP ops (attention, shared expert, embed) are replicated and not imbalanced
             ep_frac = _ep_parallel_fraction(stage_ops, model, system, strategy, gpu_name)
-            t_fwd = t_fwd * (1 - ep_frac) + t_fwd * ep_frac * imb
-            t_bwd_dx = t_bwd_dx * (1 - ep_frac) + t_bwd_dx * ep_frac * imb
-            t_bwd_dw = t_bwd_dw * (1 - ep_frac) + t_bwd_dw * ep_frac * imb
+            t_fwd = t_fwd * (1 - ep_frac) + t_fwd * ep_frac * ep_imbalance
+            t_bwd_dx = t_bwd_dx * (1 - ep_frac) + t_bwd_dx * ep_frac * ep_imbalance
+            t_bwd_dw = t_bwd_dw * (1 - ep_frac) + t_bwd_dw * ep_frac * ep_imbalance
             # Keep tracked recompute consistent with the scaled bwd it lives in.
-            t_recompute = t_recompute * (1 - ep_frac) + t_recompute * ep_frac * imb
+            t_recompute = t_recompute * (1 - ep_frac) + t_recompute * ep_frac * ep_imbalance
             # Apply imbalance to EP comm only (CP and TP are not EP-parallel)
             # Track the EP comm before imbalance to compute the delta
             ep_comm_fwd_before = t_ep_raw_comm_fwd
             ep_comm_bwd_before = t_ep_raw_comm_bwd
-            t_ep_raw_comm_fwd *= imb
-            t_ep_raw_comm_bwd *= imb
+            t_ep_raw_comm_fwd *= ep_imbalance
+            t_ep_raw_comm_bwd *= ep_imbalance
             # Rebuild combined t_comm_fwd/bwd with imbalanced EP
             t_comm_fwd = t_other_comm_fwd + t_tp_exposed_fwd + t_cp_comm_fwd + t_ep_raw_comm_fwd
             t_comm_bwd = t_other_comm_bwd + t_tp_exposed_bwd + t_cp_comm_bwd + t_ep_raw_comm_bwd
@@ -345,7 +360,7 @@ def stage_time(
         t_ep_gemm_fwd = _ep_gemm_time(stage_ops, model, system, strategy, gpu_name)
         t_ep_gemm_bwd = 0.0
         for op in stage_ops:
-            if op.kind == "matmul" and "routed_expert" in op.name:
+            if _is_routed_expert_compute(op):
                 cost = op_cost(op, model, system)
                 op_overlap = gpu.overlap_ratio.get(op.kind, 0.0)
                 op_dtype = _resolve_compute_dtype(op, model)
@@ -421,6 +436,20 @@ def stage_time(
         # EP exposed per direction
         t_ep_exposed_fwd = max(0.0, t_ep_raw_comm_fwd - saved_fwd)
         t_ep_exposed_bwd = max(0.0, t_ep_raw_comm_bwd - saved_bwd)
+
+    # MegaMoE fused internal dispatch/combine is not part of the raw external
+    # EP A2A pool above, so scale it here without feeding it back through the
+    # legacy ep_overlap post-process.
+    fused_ep_comm_fwd = t_fused_ep_comm_fwd * ep_imbalance
+    fused_ep_comm_bwd = t_fused_ep_comm_bwd * ep_imbalance
+    fused_ep_hidden = t_fused_ep_hidden * ep_imbalance
+    t_comm_fwd += fused_ep_comm_fwd
+    t_comm_bwd += fused_ep_comm_bwd
+    t_fwd += fused_ep_comm_fwd
+    t_bwd_dx += fused_ep_comm_bwd
+    t_ep_hidden += fused_ep_hidden
+    t_ep_exposed_fwd += fused_ep_comm_fwd
+    t_ep_exposed_bwd += fused_ep_comm_bwd
 
     t_bwd = t_bwd_dx + t_bwd_dw
     return StageTime(
@@ -513,7 +542,7 @@ def _ep_parallel_fraction(
         else:
             continue
         t_total += t
-        if op.kind == "matmul" and "routed_expert" in op.name:
+        if _is_routed_expert_compute(op):
             t_ep += t
     if t_total <= 0:
         return 0.0
@@ -572,12 +601,18 @@ def _ep_gemm_time(
     """Routed expert GEMM time (seconds) — the compute that overlaps with EP A2A."""
     total = 0.0
     for op in ops:
-        if op.kind == "matmul" and "routed_expert" in op.name:
+        if _is_routed_expert_compute(op):
             cost = op_cost(op, model, system)
             op_dtype = _resolve_compute_dtype(op, model)
             total += _cost_phase_time(cost, "fwd", system, gpu_name,
                                       system.gpu.overlap_ratio.get(op.kind, 0.0), op_dtype)
     return total
+
+
+def _is_routed_expert_compute(op: Op) -> bool:
+    return op.kind == "mega_moe" or (
+        op.kind == "matmul" and "routed_expert" in op.name
+    )
 
 
 def _tp_gemm_time(

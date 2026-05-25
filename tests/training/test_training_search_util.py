@@ -232,6 +232,13 @@ class TestMakeStrategyFromConfig:
 
         assert strategy.cp_kind == CPKind.ULYSSES
 
+    def test_mega_moe_fields(self):
+        config = {"mega_moe": True, "mega_moe_waves": 4}
+        strategy = _make_strategy_from_config(config)
+
+        assert strategy.mega_moe is True
+        assert strategy.mega_moe_waves == 4
+
 
 class TestTrainingConfigManager:
     """Test TrainingConfigManager functionality."""

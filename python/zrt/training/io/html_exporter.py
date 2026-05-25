@@ -283,6 +283,35 @@ def _op_formula(op, cost):
     if op.kind == "hash_route":
         return "negligible", "negligible", "negligible", "negligible"
 
+    if op.kind == "mega_moe":
+        from zrt.training.models.mega_moe import mega_moe_cost_terms
+
+        terms = mega_moe_cost_terms(op)
+        mm = m.get("m", 0)
+        micro_batch = m.get("micro_batch", 1)
+        tokens = terms.tokens
+        nn = terms.n
+        kk = terms.k_eff
+        top_k = terms.top_k
+        mult = f"{terms.fwd_multiplier:g}"
+        quant = terms.quant_variant
+        waves = m.get("requested_waves", 0)
+        local_experts = terms.local_experts
+        fwd_str = (
+            "Mega MoE dispatch+FFN+combine: "
+            f"m={mm}, micro_batch={micro_batch}, tokens={tokens}, "
+            f"top_k={top_k}, k={kk}, n={nn}, experts/rank={local_experts}, "
+            f"mult={mult}, quant={quant}, waves={waves}; "
+            f"2*tokens*top_k*k*n*mult = 2*{tokens}*{top_k}*{kk}*{nn}*{mult} = {_fmt_e(ff)}"
+        )
+        bwd_str = f"dx+dw = 2*fwd = {_fmt_e(df + wf)}"
+        bytes_str = (
+            "act_in+act_out+stored_weights "
+            f"(quant={quant}) = {_fmt_e(cost.fwd_bytes)}"
+        )
+        bwd_bytes_str = f"same fused traffic per dx/dw = {_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
     return (
         f"fwd = {_fmt_e(ff)}",
         f"bwd = {_fmt_e(df + wf)}",
@@ -442,8 +471,21 @@ def _op_to_dict(op: "Op", cost: "OpCost", system) -> dict:
         "bwd_formula": detail["bwd_formula"],
         "fwd_bytes_formula": detail["fwd_bytes_formula"],
         "bwd_bytes_formula": detail["bwd_bytes_formula"],
-        "meta": getattr(op, "meta", {}) or {},
+        "meta": _json_safe_meta(getattr(op, "meta", {}) or {}),
     }
+
+
+def _json_safe_meta(meta: dict) -> dict:
+    def convert(value):
+        if hasattr(value, "value"):
+            return value.value
+        if isinstance(value, dict):
+            return {k: convert(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [convert(v) for v in value]
+        return value
+
+    return {k: convert(v) for k, v in meta.items()}
 
 
 def _enum_value(x) -> str:
