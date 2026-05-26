@@ -21,6 +21,7 @@ from tqdm import tqdm
 # - Difference: 1000 bytes / 1e9 = 1.00 decimal GB, 1000 bytes / 1024**3 = 0.93 GiB (~7%)
 
 from zrt.hardware.registry import load as load_hw
+from zrt.training.analysis.mhc import analyze_mhc
 from zrt.training.io.config_loader import _parse_model, _parse_system, _parse_strategy
 from zrt.training.models.memory import memory_breakdown
 from zrt.training.search.estimator import estimate
@@ -761,6 +762,10 @@ def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
             graph = build_graph(model, strategy)
             _WORKER_GRAPH_CACHE[graph_key] = graph
         report = estimate(model, system, strategy, graph=graph)
+        report._mhc_analysis = analyze_mhc(
+            report, graph, model, system, strategy,
+            include_counterfactual=True,
+        )
 
         return {
             "status": "success",
@@ -818,6 +823,7 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         d["bubble_fraction"] = round(report.bubble_fraction, 4)
         d["bubble_time_ms"] = round(report.bubble_time_ms, 2)
         d["tokens_per_sec"] = round(report.tokens_per_sec, 1)
+        d.update(_mhc_summary_columns(report))
         if report.memory:
             # Per-rank weight/grad/opt-state can drop to single-digit MB after
             # ZeRO-3 + EP + TP sharding; 2-decimal GB rounds those to 0.00 and
@@ -841,12 +847,37 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
                    "optimizer_compute_ms", "optimizer_comm_ms", "optimizer_exposed_ms", "recompute_time_ms",
                    "recompute_time_raw_ms", "step_time_ms", "pipeline_time_ms",
                    "mfu", "mfu_native", "hfu", "bubble_fraction", "bubble_time_ms", "tokens_per_sec",
+                   "mhc_enabled", "mhc_total_ms", "mhc_step_share", "mhc_compute_share",
+                   "mhc_delta_step_ms", "mhc_delta_step_pct",
                    "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
                    "comm_buffers_gb", "memory_gb"]
     config_cols = [k for k in rows[0].keys() if k not in metric_cols] if rows else []
     cols = config_cols + [c for c in metric_cols if c in df.columns]
     df = df[[c for c in cols if c in df.columns]]
     return df
+
+
+def _mhc_summary_columns(report: TrainingReport) -> dict[str, float | bool]:
+    analysis = getattr(report, "_mhc_analysis", None)
+    if analysis is None:
+        return {
+            "mhc_enabled": False,
+            "mhc_total_ms": 0.0,
+            "mhc_step_share": 0.0,
+            "mhc_compute_share": 0.0,
+            "mhc_delta_step_ms": 0.0,
+            "mhc_delta_step_pct": 0.0,
+        }
+
+    cf = analysis.counterfactual
+    return {
+        "mhc_enabled": bool(analysis.enabled),
+        "mhc_total_ms": round(analysis.total.total_ms, 4),
+        "mhc_step_share": round(analysis.shares.step_time, 6),
+        "mhc_compute_share": round(analysis.shares.compute_time, 6),
+        "mhc_delta_step_ms": round(cf.delta_step_time_ms, 4) if cf else 0.0,
+        "mhc_delta_step_pct": round(cf.delta_step_time_pct, 4) if cf else 0.0,
+    }
 
 
 def save_results(df: pd.DataFrame, output_path: str):

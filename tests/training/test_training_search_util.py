@@ -760,6 +760,40 @@ class TestFormatResults:
 
         assert df.iloc[0]["optimizer_compute_ms"] > 0.0
 
+    def test_format_results_includes_mhc_summary_columns(self):
+        from zrt.training.analysis.mhc import (
+            MHCAnalysis,
+            MHCCounterfactual,
+            MHCMetric,
+            MHCShare,
+        )
+
+        report = TrainingReport(step_time_ms=10.0, compute_time_ms=5.0, mfu=0.1)
+        report._mhc_analysis = MHCAnalysis(
+            enabled=True,
+            hc_mult=4,
+            hc_sinkhorn_iters=3,
+            op_counts={"mhc_pre": 1},
+            by_kind={"mhc_pre": MHCMetric(count=1, total_ms=2.0)},
+            total=MHCMetric(count=1, total_ms=2.0),
+            shares=MHCShare(step_time=0.2, compute_time=0.4, recompute_time=0.0),
+            counterfactual=MHCCounterfactual(
+                hc_on_step_time_ms=10.0,
+                hc_off_step_time_ms=8.0,
+                delta_step_time_ms=2.0,
+                delta_step_time_pct=25.0,
+            ),
+        )
+
+        df = format_results([report], [{"model": "m"}])
+
+        assert bool(df.loc[0, "mhc_enabled"]) is True
+        assert df.loc[0, "mhc_total_ms"] == 2.0
+        assert df.loc[0, "mhc_step_share"] == 0.2
+        assert df.loc[0, "mhc_compute_share"] == 0.4
+        assert df.loc[0, "mhc_delta_step_ms"] == 2.0
+        assert df.loc[0, "mhc_delta_step_pct"] == 25.0
+
     def test_format_results_includes_comm_totals(self):
         """验证 format_results 包含各策略的通信总时间字段，且列按策略分组."""
         report = TrainingReport(

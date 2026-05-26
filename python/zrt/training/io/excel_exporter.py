@@ -1,6 +1,6 @@
 """Excel exporter for spec-based training estimation (--estimate-config).
 
-Produces a single workbook with six sheets:
+Produces a single workbook with seven sheets:
   1. Summary   — E2E timing, MFU, memory, pipeline, FLOPs
   2. Ops       — Per-op details (name, kind, layer, flops, bytes, bound, latency)
   3. Model     — Model geometry, MoE, HC, MLA, dtype
@@ -413,7 +413,85 @@ def export_estimate_excel(
         strat_rows.append(["  None", "", ""])
     _write_sheet(ws5, strat_rows, col_widths=[30, 45, 10])
 
-    # Sheet 6: Communication Domains
+    # Sheet 6: MHC Analysis
+    from zrt.training.analysis.mhc import analyze_mhc
+
+    ws_mhc = wb.create_sheet("MHC Analysis")
+    mhc = analyze_mhc(
+        report, graph, model, system, strategy,
+        op_costs=op_costs,
+        include_counterfactual=True,
+    )
+
+    def _fmt_ms(x: float) -> str:
+        return f"{x:.4f}"
+
+    def _fmt_pct(x: float) -> str:
+        return f"{x:.2%}"
+
+    def _fmt_sci(x: float) -> str:
+        return f"{x:.2e}" if x else "0.00e+00"
+
+    mhc_rows = [
+        ["Metric", "Value", "Unit"],
+        ["Enabled", str(mhc.enabled), ""],
+        ["HC Mult", mhc.hc_mult, ""],
+        ["HC Sinkhorn Iters", mhc.hc_sinkhorn_iters, ""],
+        ["Total MHC Time", _fmt_ms(mhc.total.total_ms), "ms"],
+        ["  FWD", _fmt_ms(mhc.total.fwd_ms), "ms"],
+        ["  BWD dX", _fmt_ms(mhc.total.bwd_dx_ms), "ms"],
+        ["  BWD dW", _fmt_ms(mhc.total.bwd_dw_ms), "ms"],
+        ["MHC Share of Step", _fmt_pct(mhc.shares.step_time), ""],
+        ["MHC Share of Compute", _fmt_pct(mhc.shares.compute_time), ""],
+        ["MHC Share of Recompute", _fmt_pct(mhc.shares.recompute_time), ""],
+        ["Total MHC FLOPs", _fmt_sci(mhc.total.total_flops), ""],
+        ["Total MHC Bytes", _fmt_sci(mhc.total.total_bytes), ""],
+        ["", "", ""],
+        ["By Kind", "", ""],
+        ["Kind", "Count", "FWD ms", "BWD dX ms", "BWD dW ms", "Total ms", "Total FLOPs", "Total Bytes"],
+    ]
+    for kind in sorted(mhc.by_kind):
+        metric = mhc.by_kind[kind]
+        mhc_rows.append([
+            kind,
+            metric.count,
+            _fmt_ms(metric.fwd_ms),
+            _fmt_ms(metric.bwd_dx_ms),
+            _fmt_ms(metric.bwd_dw_ms),
+            _fmt_ms(metric.total_ms),
+            _fmt_sci(metric.total_flops),
+            _fmt_sci(metric.total_bytes),
+        ])
+
+    mhc_rows.extend([
+        ["", "", ""],
+        ["Counterfactual", "HC On", "HC Off", "Delta", "Delta %"],
+    ])
+    cf = mhc.counterfactual
+    if cf is None:
+        mhc_rows.append(["Not run", "", "", "", ""])
+    elif cf.error:
+        mhc_rows.append(["Error", cf.error, "", "", ""])
+    else:
+        mhc_rows.extend([
+            ["Step Time (ms)", _fmt_ms(cf.hc_on_step_time_ms), _fmt_ms(cf.hc_off_step_time_ms),
+             _fmt_ms(cf.delta_step_time_ms), f"{cf.delta_step_time_pct:.2f}%"],
+            ["Compute Time (ms)", _fmt_ms(cf.hc_on_compute_time_ms), _fmt_ms(cf.hc_off_compute_time_ms),
+             _fmt_ms(cf.delta_compute_time_ms), f"{cf.delta_compute_time_pct:.2f}%"],
+            ["FWD Compute (ms)", _fmt_ms(cf.hc_on_fwd_compute_ms), _fmt_ms(cf.hc_off_fwd_compute_ms), "", ""],
+            ["BWD Compute (ms)", _fmt_ms(cf.hc_on_bwd_compute_ms), _fmt_ms(cf.hc_off_bwd_compute_ms), "", ""],
+            ["Recompute (ms)", _fmt_ms(cf.hc_on_recompute_time_ms), _fmt_ms(cf.hc_off_recompute_time_ms), "", ""],
+            ["Memory (GB)",
+             f"{cf.hc_on_memory_gb:.4f}" if cf.hc_on_memory_gb is not None else "N/A",
+             f"{cf.hc_off_memory_gb:.4f}" if cf.hc_off_memory_gb is not None else "N/A",
+             "", ""],
+            ["MFU", f"{cf.hc_on_mfu:.4%}", f"{cf.hc_off_mfu:.4%}", "", ""],
+            ["MFU Native", f"{cf.hc_on_mfu_native:.4%}", f"{cf.hc_off_mfu_native:.4%}", "", ""],
+            ["HFU", f"{cf.hc_on_hfu:.4%}", f"{cf.hc_off_hfu:.4%}", "", ""],
+        ])
+    _write_sheet(ws_mhc, mhc_rows, col_widths=[28, 18, 18, 18, 18, 18, 18, 18])
+
+    # Sheet 7: Communication Domains
     from zrt.training.topology import comm_domain_report
 
     ws6 = wb.create_sheet("Comm Domains")

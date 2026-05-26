@@ -112,3 +112,38 @@ def test_excel_ops_latency_uses_routed_expert_compute_dtype(tmp_path):
 
     assert actual_us == pytest.approx(expected_us, abs=0.01)
     assert actual_us != pytest.approx(bf16_us, rel=1e-3)
+
+
+def test_excel_includes_mhc_analysis_sheet(tmp_path):
+    from zrt.training.ir.builders import build_graph
+    from zrt.training.search.estimator import estimate
+
+    model = _model()
+    model.hc_mult = 4
+    model.hc_sinkhorn_iters = 3
+    system = _system()
+    strategy = Strategy()
+    graph = build_graph(model, strategy)
+    report = estimate(model, system, strategy, graph=graph)
+    op_costs = {op.name: op_cost(op, model, system) for op in graph.ops}
+
+    path = tmp_path / "report.xlsx"
+    export_estimate_excel(
+        report=report,
+        graph=graph,
+        model=model,
+        system=system,
+        strategy=strategy,
+        op_costs=op_costs,
+        output_path=path,
+    )
+
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    assert "MHC Analysis" in wb.sheetnames
+    ws = wb["MHC Analysis"]
+    values = [row for row in ws.iter_rows(values_only=True)]
+    assert any(
+        row[0] == "Total MHC Time" and float(row[1]) > 0
+        for row in values
+        if row
+    )
