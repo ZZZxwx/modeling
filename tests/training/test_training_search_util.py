@@ -446,6 +446,60 @@ class TestTrainingConfigManager:
         configs = manager.generate_static_configs()
         assert manager.count_total_configs() == len(configs)
 
+    def test_total_token_derives_exact_global_batch_from_each_seq_len(self):
+        manager = TrainingConfigManager(
+            param_grid={
+                "model": ["deepseek_v3_2"],
+                "hw": ["nvidia_h100_sxm"],
+                "world_size": [1],
+                "seq_len": [512, 256],
+                "total_token": [1024],
+                "tp": [1],
+                "cp": [1],
+                "pp": [1],
+                "ep": [1],
+                "dp": [1],
+                "micro_batch": [1],
+                "global_batch": [128, 256],
+                "zero_stage": [0],
+                "pp_schedule": ["1f1b"],
+                "recompute": ["none"],
+                "optimizer": ["adam"],
+            }
+        )
+
+        configs = manager.generate_static_configs()
+
+        assert [(c["seq_len"], c["global_batch"]) for c in configs] == [
+            (512, 2),
+            (256, 4),
+        ]
+        assert manager.count_total_configs() == len(configs)
+
+    def test_total_token_rejects_seq_len_with_remainder(self):
+        manager = TrainingConfigManager(
+            param_grid={
+                "model": ["deepseek_v3_2"],
+                "hw": ["nvidia_h100_sxm"],
+                "world_size": [1],
+                "seq_len": [512],
+                "total_token": [1025],
+                "tp": [1],
+                "cp": [1],
+                "pp": [1],
+                "ep": [1],
+                "dp": [1],
+                "micro_batch": [1],
+                "zero_stage": [0],
+                "pp_schedule": ["1f1b"],
+                "recompute": ["none"],
+                "optimizer": ["adam"],
+            }
+        )
+
+        with pytest.raises(ValueError, match="total_token.*divisible.*seq_len"):
+            manager.generate_static_configs()
+
     def test_search_filters_non_divisible_ep_dp_combos(self):
         manager = TrainingConfigManager(
             param_grid={
@@ -531,6 +585,7 @@ class TestTrainingConfigManager:
             "pp_schedule": "1f1b",
             "recompute": "none",
             "optimizer": "adam",
+            "max_memory_gb": 1024,
         })
 
         assert result["status"] == "success"
@@ -556,6 +611,7 @@ class TestTrainingConfigManager:
             "recompute": "none",
             "optimizer": "muon",
             "muon_rotation": True,
+            "max_memory_gb": 1024,
         }
 
         result = run_training_task_wrapper(cfg)

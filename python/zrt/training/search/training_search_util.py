@@ -74,6 +74,36 @@ def _reject_gpus_per_node_config(config_or_grid: Dict[str, Any]) -> None:
         )
 
 
+def _exact_global_batch_from_total_token(total_token: int | float, seq_len: int | float) -> int:
+    if seq_len <= 0:
+        raise ValueError("seq_len must be positive when deriving global_batch from total_token")
+    total = int(total_token)
+    seq = int(seq_len)
+    if total != float(total_token) or seq != float(seq_len):
+        raise ValueError("total_token and seq_len must be integers")
+    if total % seq != 0:
+        raise ValueError(
+            f"total_token must be divisible by seq_len in exact-token mode: "
+            f"total_token={total}, seq_len={seq}"
+        )
+    return total // seq
+
+
+def _apply_total_token_batch_rule(
+    config: Dict[str, Any],
+    *,
+    default_seq_len: int,
+    model: ModelSpec | None = None,
+) -> None:
+    total_token = config.get("total_token")
+    seq_len = config.get("seq_len", default_seq_len)
+    if total_token is not None and total_token > 0:
+        config["seq_len"] = int(seq_len)
+        config["global_batch"] = _exact_global_batch_from_total_token(total_token, seq_len)
+    if model is not None and seq_len is not None:
+        model.seq_len = int(seq_len)
+
+
 def _warn_if_partial_allocation(system: SystemSpec) -> None:
     if system.idle_gpus > 0:
         logger.warning(
@@ -530,8 +560,8 @@ class TrainingConfigManager:
         has_total_token = total_token_vals and any(v is not None and v > 0 for v in total_token_vals)
         
         other_keys = [k for k in grid.keys() if k not in parallel_keys and k != "world_size"]
-        if has_total_token and "seq_len" in other_keys:
-            other_keys.remove("seq_len")
+        if has_total_token and "global_batch" in other_keys:
+            other_keys.remove("global_batch")
 
         hw_name = grid.get("hw", ["nvidia_h100_sxm"])[0] if grid.get("hw") else "nvidia_h100_sxm"
 
@@ -564,6 +594,9 @@ class TrainingConfigManager:
         total = 0
         for other_vals in itertools.product(*[grid[k] for k in other_keys]):
             base_config = dict(zip(other_keys, other_vals))
+            _apply_total_token_batch_rule(
+                base_config, default_seq_len=seq_len, model=model,
+            )
             total += sum(1 for _ in self._enumerate_valid_parallel_configs(
                 grid, target_ws, model, system, base_config
             ))
@@ -595,8 +628,8 @@ class TrainingConfigManager:
         has_total_token = total_token_vals and any(v is not None and v > 0 for v in total_token_vals)
         
         other_keys = [k for k in grid.keys() if k not in parallel_keys and k != "world_size"]
-        if has_total_token and "seq_len" in other_keys:
-            other_keys.remove("seq_len")
+        if has_total_token and "global_batch" in other_keys:
+            other_keys.remove("global_batch")
 
         hw_name = grid.get("hw", ["nvidia_h100_sxm"])[0] if grid.get("hw") else "nvidia_h100_sxm"
 
@@ -628,18 +661,9 @@ class TrainingConfigManager:
             base_config = dict(zip(other_keys, other_vals))
             base_config["world_size"] = target_ws
 
-            total_token = base_config.get("total_token")
-            if total_token is not None and total_token > 0:
-                global_batch = base_config.get("global_batch", 0)
-                if global_batch > 0:
-                    seq_len = int(total_token / global_batch)
-                    base_config["seq_len"] = seq_len
-                    if model is not None:
-                        model.seq_len = seq_len
-            else:
-                seq_len = base_config.get("seq_len")
-                if seq_len is not None and model is not None:
-                    model.seq_len = seq_len
+            _apply_total_token_batch_rule(
+                base_config, default_seq_len=seq_len, model=model,
+            )
 
             for p_vals in self._enumerate_valid_parallel_configs(
                     grid, target_ws, model, system, base_config
@@ -1106,12 +1130,12 @@ if __name__ == "__main__":
         "cp": [1, 2, 4, 8, 16, 32, 64, 128],
         "pp": [1, 2, 4, 8, 16],
         # EP must divide DP under the current expert-DP sharding model.
-        "ep": [128],
+        "ep": [32, 64, 128],
         "dp": "auto",
         "micro_batch": [1, 16, 32],
-        "global_batch": [512, 1024, 2048, 4096, 8192, 65536],
-        "seq_len": [8192, 32768, 131072],
-        "total_token": [536870912],
+        # Derived per seq_len as exact total_token // seq_len.
+        "seq_len": [8192, 65536, 131072, 262144, 524288, 1048576],
+        "total_token": [100663296],
         "zero_stage": [3],
         "pp_schedule": ["dualpipev"],
         "cp_kind": ["ulysses"],
