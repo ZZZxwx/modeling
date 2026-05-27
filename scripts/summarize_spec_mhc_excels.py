@@ -14,6 +14,7 @@ try:
         sheet_key_values,
         step_time_ms,
         strategy_values,
+        total_time_from_ops,
         value_as_float,
         write_summary_xlsx,
     )
@@ -28,6 +29,7 @@ except ModuleNotFoundError:
         sheet_key_values,
         step_time_ms,
         strategy_values,
+        total_time_from_ops,
         value_as_float,
         write_summary_xlsx,
     )
@@ -81,8 +83,10 @@ COLUMNS = [
     "bubble_fraction",
     "bubble_time_ms",
     "tokens_per_sec",
+    "ops_total_ms",
     "mhc_total_ms",
     "mhc_step_share",
+    "mhc_ops_share",
     "mhc_compute_share",
     "mhc_recompute_share",
     "mhc_delta_step_ms",
@@ -124,6 +128,7 @@ def summarize_mhc_reports(input_dir: str | Path) -> list[dict[str, object]]:
         if "Step Time" not in summary:
             continue
         step_ms = step_time_ms(wb)
+        ops_total_ms = total_time_from_ops(wb)
         mhc = sheet_key_values(wb, "MHC Analysis")
         if mhc:
             mhc_ms = value_as_float(mhc.get("Total MHC Time"))
@@ -132,8 +137,10 @@ def summarize_mhc_reports(input_dir: str | Path) -> list[dict[str, object]]:
                 share = mhc_ms / step_ms
             row = {
                 **_mhc_analysis_values(wb),
+                "ops_total_ms": ops_total_ms,
                 "mhc_total_ms": mhc_ms,
                 "mhc_step_share": share,
+                "mhc_ops_share": mhc_ms / ops_total_ms if ops_total_ms else 0.0,
                 "mhc_time_source": "MHC Analysis",
             }
         else:
@@ -144,6 +151,7 @@ def summarize_mhc_reports(input_dir: str | Path) -> list[dict[str, object]]:
                 **ops_values,
                 "mhc_total_ms": mhc_ms,
                 "mhc_step_share": share,
+                "mhc_ops_share": mhc_ms / ops_total_ms if ops_total_ms else 0.0,
                 "mhc_time_source": "Ops",
             }
         rows.append({
@@ -205,7 +213,10 @@ def _mhc_counterfactual_values(wb) -> dict[str, float]:
 
 
 def _mhc_ops_values(wb) -> dict[str, object]:
-    out: dict[str, object] = {"mhc_total_ms": mhc_time_from_ops(wb)}
+    out: dict[str, object] = {
+        "ops_total_ms": total_time_from_ops(wb),
+        "mhc_total_ms": mhc_time_from_ops(wb),
+    }
     if "Ops" not in wb.sheetnames:
         return out
     ws = wb["Ops"]

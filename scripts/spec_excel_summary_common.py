@@ -166,6 +166,28 @@ def mhc_time_from_ops(wb) -> float:
     return latency_us / 1000.0
 
 
+def total_time_from_ops(wb) -> float:
+    if "Ops" not in wb.sheetnames:
+        return 0.0
+    ws = wb["Ops"]
+    rows = ws.iter_rows(values_only=True)
+    try:
+        header = [str(v).strip() if v is not None else "" for v in next(rows)]
+    except StopIteration:
+        return 0.0
+
+    latency_idx = _find_header(header, "Latency")
+    if latency_idx is None:
+        return 0.0
+
+    latency_us = 0.0
+    for row in rows:
+        if len(row) <= latency_idx:
+            continue
+        latency_us += value_as_float(row[latency_idx])
+    return latency_us / 1000.0
+
+
 def _find_header(header: list[str], target: str) -> int | None:
     target_l = target.lower()
     for idx, name in enumerate(header):
