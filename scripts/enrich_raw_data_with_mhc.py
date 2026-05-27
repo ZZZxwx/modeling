@@ -117,12 +117,18 @@ def enrich_workbook(
     report_dir: str | Path,
     default_model: str = "deepseek_v4_pro",
     no_mhc_summary_path: str | Path | None = None,
+    existing_report_dir: str | Path | None = None,
     runner: Runner | None = None,
 ) -> Path:
     input_path = Path(input_path)
     output_path = Path(output_path)
     report_dir = Path(report_dir)
+    existing_report_dir = Path(existing_report_dir) if existing_report_dir else None
     runner = runner or run_spec_report_for_config
+    existing_reports_by_name = (
+        build_existing_report_name_index(existing_report_dir)
+        if existing_report_dir is not None else {}
+    )
 
     wb = openpyxl.load_workbook(input_path)
     if "raw_data" not in wb.sheetnames:
@@ -140,16 +146,22 @@ def enrich_workbook(
     for row_idx in range(2, ws.max_row + 1):
         config = row_config(ws, headers, row_idx, default_model)
         key = config_fingerprint(config)
-        report_path = report_dir / f"{key}.xlsx"
+        report_path = (
+            existing_report_dir / f"{key}.xlsx"
+            if existing_report_dir is not None
+            else report_dir / f"{key}.xlsx"
+        )
+        if existing_report_dir is not None and not report_path.exists():
+            named_report = find_existing_report_by_row_name(config, existing_reports_by_name)
+            if named_report is not None:
+                report_path = named_report
         if key not in cache:
-            try:
-                cache[key] = runner(config, report_path)
-            except Exception as exc:
-                cache[key] = MHCBackfillResult(
-                    report_path=str(report_path),
-                    status="error",
-                    error=str(exc),
-                )
+            cache[key] = _load_or_run_mhc_result(
+                config=config,
+                report_path=report_path,
+                existing_report_dir=existing_report_dir,
+                runner=runner,
+            )
         _write_result(ws, headers, row_idx, cache[key])
         if no_mhc_summary_path is not None:
             _write_no_mhc_result(ws, headers, row_idx, config, no_mhc_by_hw)
@@ -159,10 +171,46 @@ def enrich_workbook(
     return output_path
 
 
+def _load_or_run_mhc_result(
+    *,
+    config: dict[str, object],
+    report_path: Path,
+    existing_report_dir: Path | None,
+    runner: Runner,
+) -> MHCBackfillResult:
+    if existing_report_dir is not None:
+        if not report_path.exists():
+            return MHCBackfillResult(
+                report_path=str(report_path),
+                status="missing_report",
+                error=f"existing report not found: {report_path}",
+            )
+        try:
+            return extract_mhc_result(report_path)
+        except Exception as exc:
+            return MHCBackfillResult(
+                report_path=str(report_path),
+                status="error",
+                error=str(exc),
+            )
+    try:
+        return runner(config, report_path)
+    except Exception as exc:
+        return MHCBackfillResult(
+            report_path=str(report_path),
+            status="error",
+            error=str(exc),
+        )
+
+
 def row_config(ws, headers: dict[str, int], row_idx: int,
                default_model: str) -> dict[str, object]:
     config = dict(CONFIG_DEFAULTS)
     config["model"] = _cell_value(ws, headers, row_idx, "model") or default_model
+    for optional_key in ("name", "config_name", "project", "file"):
+        raw_optional = _cell_value(ws, headers, row_idx, optional_key)
+        if raw_optional is not None and raw_optional != "":
+            config[optional_key] = raw_optional
     for key in CONFIG_DEFAULTS:
         raw = _cell_value(ws, headers, row_idx, key)
         if raw is None or raw == "":
@@ -175,6 +223,65 @@ def config_fingerprint(config: dict[str, object]) -> str:
     canonical = {key: config.get(key) for key in FINGERPRINT_KEYS}
     payload = json.dumps(canonical, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def build_existing_report_name_index(report_dir: Path) -> dict[str, Path | None]:
+    index: dict[str, Path | None] = {}
+    for path in sorted(report_dir.rglob("*.xls*"), key=lambda p: str(p).lower()):
+        if path.name.startswith("~$"):
+            continue
+        key = normalize_report_match_name(path.stem)
+        if not key:
+            continue
+        if key in index:
+            index[key] = None
+        else:
+            index[key] = path
+    return index
+
+
+def find_existing_report_by_row_name(
+    config: dict[str, object],
+    existing_reports_by_name: dict[str, Path | None],
+) -> Path | None:
+    for field in ("name", "config_name", "project", "file"):
+        raw = config.get(field)
+        if raw is None or raw == "":
+            continue
+        key = normalize_report_match_name(str(raw))
+        match = existing_reports_by_name.get(key)
+        if match is not None:
+            return match
+    return None
+
+
+def normalize_report_match_name(name: str) -> str:
+    stem = Path(str(name)).stem.lower().strip()
+    if stem.startswith("deepseek_v4_pro_"):
+        stem = stem[len("deepseek_v4_pro_"):]
+    if stem.endswith("_best"):
+        stem = stem[:-len("_best")]
+    parts = [p for p in re_split_underscores(stem) if p]
+    if not parts:
+        return ""
+    parts[-1] = normalize_batch_token(parts[-1])
+    return "_".join(parts)
+
+
+def re_split_underscores(value: str) -> list[str]:
+    return [p.strip() for p in value.replace("-", "_").split("_")]
+
+
+def normalize_batch_token(token: str) -> str:
+    text = token.strip().lower()
+    if text in {"1", "1k", "1024"}:
+        return "1024"
+    if text.endswith("k"):
+        try:
+            return str(int(float(text[:-1]) * 1024))
+        except ValueError:
+            return text
+    return text
 
 
 def load_no_mhc_summary(path: str | Path | None) -> dict[str, dict[str, object]]:
@@ -383,6 +490,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--report-dir", required=True, help="Directory for generated spec Excel reports.")
     parser.add_argument("--default-model", default="deepseek_v4_pro")
     parser.add_argument("--no-mhc-summary", help="Optional no-MHC summary .xlsx keyed by hw.")
+    parser.add_argument(
+        "--existing-report-dir",
+        help="Optional directory of pre-generated reports named by config fingerprint. "
+             "When set, reports are read instead of regenerated.",
+    )
     return parser.parse_args()
 
 
@@ -394,6 +506,7 @@ def main() -> None:
         report_dir=args.report_dir,
         default_model=args.default_model,
         no_mhc_summary_path=args.no_mhc_summary,
+        existing_report_dir=args.existing_report_dir,
     )
     print(f"Wrote enriched workbook to {out}")
 

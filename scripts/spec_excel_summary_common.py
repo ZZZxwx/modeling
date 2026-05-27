@@ -20,6 +20,27 @@ def clean_report_name(path_or_name: str | Path) -> str:
     return stem
 
 
+def normalize_report_match_name(path_or_name: str | Path) -> str:
+    stem = clean_report_name(path_or_name).lower().strip()
+    parts = [p.strip() for p in stem.replace("-", "_").split("_") if p.strip()]
+    if not parts:
+        return ""
+    parts[-1] = normalize_batch_token(parts[-1])
+    return "_".join(parts)
+
+
+def normalize_batch_token(token: str) -> str:
+    text = token.strip().lower()
+    if text in {"1", "1k", "1024"}:
+        return "1024"
+    if text.endswith("k"):
+        try:
+            return str(int(float(text[:-1]) * 1024))
+        except ValueError:
+            return text
+    return text
+
+
 def find_excel_files(input_dir: str | Path) -> list[Path]:
     root = Path(input_dir)
     files = [
