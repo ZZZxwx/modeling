@@ -84,3 +84,60 @@ def test_ep_a2a_bytes_use_cp_local_sequence_length():
     assert dispatch.attrs["msg_bytes"] == expected
     assert dispatch.attrs["comm_bytes"] == expected
     assert dispatch.inputs[0].shape == (2, 4, 64)
+
+
+def test_tp_comm_node_carries_domain_metadata():
+    node = OpNode(
+        id="row_linear",
+        op_type="aten.mm.default",
+        inputs=[_tensor("row_in", (8, 64))],
+        outputs=[_tensor("row_out", (8, 64))],
+        scope="model.layers.0.self_attn.o_proj",
+        layer="0",
+        category="compute",
+    )
+    node.annotations["tp_split"] = {"comm_after": "all_reduce"}
+    graph = OpGraph(name="tp_test", phase="train_forward", nodes={"row_linear": node}, edges=[])
+    ctx = TransformContext(
+        hw_spec=None,
+        parallel=ParallelConfig(tp=4, pp=2, dp=4, cp=4, ep=4),
+        training=TrainingConfig(micro_batch=1, seq_len=16, hidden=64),
+    )
+
+    result = CommInserterPass().run(graph, ctx)
+
+    comm = result.nodes["comm_allreduce_row_linear"]
+    assert comm.attrs["comm_group"] == "TP"
+    assert comm.attrs["comm_domain"] == "DENSE_TP"
+    assert comm.attrs["group_size"] == 4
+    assert comm.attrs["rank_sample"] == [0, 1, 2, 3]
+
+
+def test_cp_comm_nodes_carry_domain_metadata():
+    node = OpNode(
+        id="attn",
+        op_type="aten.scaled_dot_product_attention.default",
+        inputs=[_tensor("attn_in", (1, 4, 64))],
+        outputs=[_tensor("attn_out", (1, 4, 64))],
+        scope="model.layers.0.self_attn",
+        layer="0",
+        category="compute",
+    )
+    node.annotations["cp_split"] = {"kind": "ulysses"}
+    graph = OpGraph(name="cp_test", phase="train_forward", nodes={"attn": node}, edges=[])
+    ctx = TransformContext(
+        hw_spec=None,
+        parallel=ParallelConfig(tp=4, pp=2, dp=4, cp=4, ep=4),
+        training=TrainingConfig(micro_batch=1, seq_len=16, hidden=64),
+    )
+
+    result = CommInserterPass().run(graph, ctx)
+
+    cp_nodes = [n for n in result.nodes.values() if n.category == "communication"]
+    assert cp_nodes
+    for comm in cp_nodes:
+        assert comm.attrs["comm_group"] == "CP"
+        assert comm.attrs["comm_domain"] == "DENSE_CP"
+        assert comm.attrs["group_size"] == 4
+        assert comm.attrs["rank_sample"] == [0, 4, 8, 12]
+        assert comm.attrs["comm_bytes"] == comm.attrs["bytes"]

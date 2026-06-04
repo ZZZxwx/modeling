@@ -24,8 +24,16 @@ if TYPE_CHECKING:
     from python.zrt.transform.context import TransformContext
 
 
-def _make_comm_node(node_id: str, collective: str,
-                    src_node: OpNode, group_size: int) -> OpNode:
+def _make_comm_node(
+    node_id: str,
+    collective: str,
+    src_node: OpNode,
+    group_size: int,
+    *,
+    comm_group: str | None = None,
+    comm_domain: str | None = None,
+    rank_sample: list[int] | None = None,
+) -> OpNode:
     """Create a comm.* OpNode that wraps src_node's outputs."""
     node = OpNode(
         id=node_id,
@@ -37,8 +45,33 @@ def _make_comm_node(node_id: str, collective: str,
         layer=src_node.layer,
         category="communication",
     )
+    if comm_group and comm_domain and rank_sample is not None:
+        _attach_comm_domain_attrs(
+            node,
+            comm_group=comm_group,
+            comm_domain=comm_domain,
+            group_size=group_size,
+            rank_sample=rank_sample,
+        )
     _propagate_phase(src_node, node)
     return node
+
+
+def _attach_comm_domain_attrs(
+    node: OpNode,
+    *,
+    comm_group: str,
+    comm_domain: str,
+    group_size: int,
+    rank_sample: list[int],
+    comm_bytes: int | None = None,
+) -> None:
+    node.attrs["comm_group"] = comm_group
+    node.attrs["comm_domain"] = comm_domain
+    node.attrs["group_size"] = group_size
+    node.attrs["rank_sample"] = rank_sample
+    if comm_bytes is not None:
+        node.attrs["comm_bytes"] = comm_bytes
 
 
 def _propagate_phase(src: OpNode, dst: OpNode) -> None:
@@ -124,6 +157,7 @@ class CommInserterPass(GraphPass):
         if tp <= 1:
             return
 
+        domains = build_parallel_domains(ctx.parallel)
         coc_enabled = ctx.training.tp_coc if ctx.training else False
         coc_k = max(2, ctx.training.tp_coc_tile_k if ctx.training else 4)
 
@@ -135,7 +169,15 @@ class CommInserterPass(GraphPass):
             comm_id = f"comm_allreduce_{node.id}"
             if comm_id in g.nodes:
                 continue
-            comm_node = _make_comm_node(comm_id, "all_reduce", node, tp)
+            comm_node = _make_comm_node(
+                comm_id,
+                "all_reduce",
+                node,
+                domains.group_size("TP"),
+                comm_group="TP",
+                comm_domain="DENSE_TP",
+                rank_sample=domains.rank_sample("TP"),
+            )
             comm_node.annotations["inserted_by"] = "tp_pass"
             if coc_enabled:
                 comm_node.attrs["coc_tile_k"] = coc_k
@@ -274,6 +316,8 @@ class CommInserterPass(GraphPass):
         if cp <= 1:
             return
 
+        domains = build_parallel_domains(ctx.parallel)
+        cp_rank_sample = domains.rank_sample("CP")
         seq_len = ctx.training.seq_len if ctx.training else 2048
         hidden = ctx.training.hidden if ctx.training else 7168
         micro_batch = ctx.training.micro_batch if ctx.training else 1
@@ -316,6 +360,7 @@ class CommInserterPass(GraphPass):
                 pre_comm, post_comm = self._create_ulysses_comm_nodes(
                     first_node, last_node, seq_len, cp, hidden, micro_batch, phase="fwd"
                 )
+                self._attach_cp_attrs((pre_comm, post_comm), cp, cp_rank_sample)
                 _prepend_comm(g, first_node.id, pre_comm)
                 self._insert_after(g, last_node, post_comm)
 
@@ -323,19 +368,22 @@ class CommInserterPass(GraphPass):
                 ring_comm = self._create_ring_comm_node(
                     first_node, seq_len, cp, hidden, micro_batch, phase="fwd"
                 )
+                self._attach_cp_attrs((ring_comm,), cp, cp_rank_sample)
                 _prepend_comm(g, first_node.id, ring_comm)
 
             elif cp_kind == "hybrid":
                 a2a_pre, a2a_post, p2p = self._create_hybrid_comm_nodes(
                     first_node, seq_len, cp, hidden, micro_batch, phase="fwd"
                 )
+                self._attach_cp_attrs((a2a_pre, a2a_post, p2p), cp, cp_rank_sample)
                 _prepend_comm(g, first_node.id, a2a_pre)
                 self._insert_after(g, last_node, p2p)
                 self._insert_after(g, p2p, a2a_post)
 
             elif cp_kind == "compressed":
                 self._insert_compressed_cp_comm_block(
-                    g, first_node, last_node, seq_len, cp, hidden, micro_batch, phase="fwd"
+                    g, first_node, last_node, seq_len, cp, hidden, micro_batch,
+                    phase="fwd", rank_sample=cp_rank_sample
                 )
 
         for layer, nodes in layer_bwd_groups.items():
@@ -352,6 +400,7 @@ class CommInserterPass(GraphPass):
                 pre_comm, post_comm = self._create_ulysses_comm_nodes(
                     first_node, last_node, seq_len, cp, hidden, micro_batch, phase="bwd"
                 )
+                self._attach_cp_attrs((pre_comm, post_comm), cp, cp_rank_sample)
                 _prepend_comm(g, first_node.id, pre_comm)
                 self._insert_after(g, last_node, post_comm)
 
@@ -359,20 +408,40 @@ class CommInserterPass(GraphPass):
                 ring_comm = self._create_ring_comm_node(
                     first_node, seq_len, cp, hidden, micro_batch, phase="bwd"
                 )
+                self._attach_cp_attrs((ring_comm,), cp, cp_rank_sample)
                 _prepend_comm(g, first_node.id, ring_comm)
 
             elif cp_kind == "hybrid":
                 a2a_pre, a2a_post, p2p = self._create_hybrid_comm_nodes(
                     first_node, seq_len, cp, hidden, micro_batch, phase="bwd"
                 )
+                self._attach_cp_attrs((a2a_pre, a2a_post, p2p), cp, cp_rank_sample)
                 _prepend_comm(g, first_node.id, a2a_pre)
                 self._insert_after(g, last_node, p2p)
                 self._insert_after(g, p2p, a2a_post)
 
             elif cp_kind == "compressed":
                 self._insert_compressed_cp_comm_block(
-                    g, first_node, last_node, seq_len, cp, hidden, micro_batch, phase="bwd"
+                    g, first_node, last_node, seq_len, cp, hidden, micro_batch,
+                    phase="bwd", rank_sample=cp_rank_sample
                 )
+
+    def _attach_cp_attrs(
+        self,
+        nodes: tuple[OpNode, ...],
+        cp: int,
+        rank_sample: list[int],
+    ) -> None:
+        for node in nodes:
+            comm_bytes = node.attrs.get("bytes")
+            _attach_comm_domain_attrs(
+                node,
+                comm_group="CP",
+                comm_domain="DENSE_CP",
+                group_size=cp,
+                rank_sample=rank_sample,
+                comm_bytes=comm_bytes,
+            )
 
     def _create_ulysses_comm_nodes(
         self, first_node: OpNode, last_node: OpNode,
@@ -574,7 +643,8 @@ class CommInserterPass(GraphPass):
 
     def _insert_compressed_cp_comm_block(
         self, g: "OpGraph", first_node: OpNode, last_node: OpNode,
-        seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
+        seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str,
+        rank_sample: list[int]
     ) -> None:
         """DeepSeek-V4两段式Compressed CP，只在block边界插入。"""
         layer = first_node.layer or "root"
@@ -622,6 +692,7 @@ class CommInserterPass(GraphPass):
             layer=layer,
             category="communication",
         )
+        self._attach_cp_attrs((p2p_comm,), cp, rank_sample)
         _prepend_comm(g, first_node.id, p2p_comm)
 
         # Stage 2: AllGather compressed KV (after block)
@@ -650,6 +721,7 @@ class CommInserterPass(GraphPass):
             layer=layer,
             category="communication",
         )
+        self._attach_cp_attrs((ag_comm,), cp, rank_sample)
         self._insert_after(g, last_node, ag_comm)
 
     def _insert_after(self, graph: "OpGraph", src_node: OpNode, comm_node: OpNode) -> None:
