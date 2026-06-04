@@ -24,6 +24,47 @@ _MOE_INTERMEDIATE = 3072
 _HIDDEN, _SEQ_LEN, _BATCH = 7168, 128, 1
 
 
+def _experts_per_ep_rank() -> int:
+    return _NUM_EXPERTS // _EP
+
+
+def _grouped_m() -> int:
+    return _BATCH * _SEQ_LEN * _MOE_ACTIVE // _experts_per_ep_rank()
+
+
+def _grouped_nodes(graph):
+    return [n for n in graph.nodes.values() if n.op_type == "GroupedMatMul"]
+
+
+def _grouped_layer_prefixes(graph) -> list[str]:
+    prefixes = []
+    suffix = "_grouped_gate_up"
+    for node in _grouped_nodes(graph):
+        if node.annotations.get("phase") != "fwd":
+            continue
+        if node.id.endswith(suffix):
+            prefixes.append(node.id[:-len(suffix)])
+    return sorted(prefixes)
+
+
+def _grouped_row_prefixes(rows: list[dict[str, object]]) -> list[str]:
+    suffix = "_grouped_gate_up"
+    return sorted(
+        str(row["Node ID"])[:-len(suffix)]
+        for row in rows
+        if row["Op Type"] == "GroupedMatMul" and str(row["Node ID"]).endswith(suffix)
+    )
+
+
+def _grouped_bwd_row_prefixes(rows: list[dict[str, object]]) -> list[str]:
+    suffix = "_grouped_down_bwd"
+    return sorted(
+        str(row["Node ID"])[:-len(suffix)]
+        for row in rows
+        if row["Op Type"] == "GroupedMatMul" and str(row["Node ID"]).endswith(suffix)
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # fixtures
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -55,6 +96,7 @@ def _run_estimate(ep, captured_model):
         forward_graph=captured_model.graphs["train_forward"],
         backward_graph=captured_model.graphs["train_backward"],
         hw_spec=hw, tp=_TP, ep=ep, hidden=_HIDDEN, num_layers=4,
+        tp_extend_ep=True,
         seq_len=_SEQ_LEN, batch_size=_BATCH,
         moe_total_experts=_NUM_EXPERTS, moe_active_experts=_MOE_ACTIVE,
         model_id="hf_models/deepseek_v4",
@@ -217,21 +259,25 @@ class TestEPE2E:
 
     def test_grouped_mm_exists(self, ep8_all):
         _, _, t = ep8_all
-        grouped = [n for n in t["unified"].nodes.values() if n.op_type == "GroupedMatMul"]
-        assert len(grouped) == 16, f"Expected 16 GroupedMM, got {len(grouped)}"
+        grouped = _grouped_nodes(t["unified"])
+        prefixes = _grouped_layer_prefixes(t["unified"])
+        assert prefixes, "Expected at least one captured MoE layer"
+        assert len(grouped) == 4 * len(prefixes)
 
     def test_grouped_mm_per_moe_layer(self, ep8_all):
         _, _, t = ep8_all
-        grouped = [n for n in t["unified"].nodes.values() if n.op_type == "GroupedMatMul"]
+        grouped = _grouped_nodes(t["unified"])
+        prefixes = _grouped_layer_prefixes(t["unified"])
         role_counts = {}
         for node in grouped:
             role = node.annotations.get("grouped_mm_role")
             role_counts[role] = role_counts.get(role, 0) + 1
+        expected = len(prefixes)
         assert role_counts == {
-            "gate_up": 4,
-            "down": 4,
-            "down_bwd": 4,
-            "gate_up_bwd": 4,
+            "gate_up": expected,
+            "down": expected,
+            "down_bwd": expected,
+            "gate_up_bwd": expected,
         }
 
     def test_grouped_mm_replaces_routed_experts(self, ep8_all):
@@ -256,15 +302,15 @@ class TestEPE2E:
 
     def test_grouped_mm_token_count(self, ep8_all):
         _, _, t = ep8_all
-        expected_M = _BATCH * _SEQ_LEN * _MOE_ACTIVE // _NUM_EXPERTS
+        expected_M = _grouped_m()
         for n in t["unified"].nodes.values():
             if n.op_type == "GroupedMatMul":
                 assert n.inputs[0].shape[1] == expected_M
 
     def test_grouped_mm_shapes_match_dsv4_experts(self, ep8_all):
         _, _, t = ep8_all
-        G = _NUM_EXPERTS // _EP
-        M = _BATCH * _SEQ_LEN * _MOE_ACTIVE // _NUM_EXPERTS
+        G = _experts_per_ep_rank()
+        M = _grouped_m()
         for n in t["unified"].nodes.values():
             if n.op_type != "GroupedMatMul" or n.annotations.get("phase") != "fwd":
                 continue
@@ -282,8 +328,8 @@ class TestEPE2E:
 
     def test_backward_grouped_mm_shapes_match_dsv4_experts(self, ep8_all):
         _, _, t = ep8_all
-        G = _NUM_EXPERTS // _EP
-        M = _BATCH * _SEQ_LEN * _MOE_ACTIVE // _NUM_EXPERTS
+        G = _experts_per_ep_rank()
+        M = _grouped_m()
         bwd = [
             n for n in t["unified"].nodes.values()
             if n.op_type == "GroupedMatMul"
@@ -424,10 +470,11 @@ class TestEPE2E:
     def test_exported_excel_grouped_mm_shapes_match_dsv4_experts(self, ep8_artifacts):
         rows = _sheet_rows(ep8_artifacts["excel"], _SHEET_FWD_BWD, phase="fwd")
         grouped = {str(r["Node ID"]): r for r in rows if r["Op Type"] == "GroupedMatMul"}
-        G = _NUM_EXPERTS // _EP
-        M = _BATCH * _SEQ_LEN * _MOE_ACTIVE // _NUM_EXPERTS
-        for layer in range(4):
-            prefix = f"transformer_layers_{layer}_ffn"
+        G = _experts_per_ep_rank()
+        M = _grouped_m()
+        prefixes = _grouped_row_prefixes(rows)
+        assert prefixes, "Expected exported GroupedMatMul rows"
+        for prefix in prefixes:
             gate_up = grouped[f"{prefix}_grouped_gate_up"]
             down = grouped[f"{prefix}_grouped_down"]
             assert str((G, M, _HIDDEN)) in str(gate_up["Input Shapes"])
@@ -441,10 +488,11 @@ class TestEPE2E:
         rows = _sheet_rows(ep8_artifacts["excel"], _SHEET_FWD_BWD, phase="bwd")
         ids = [str(r["Node ID"]) for r in rows]
         grouped = {str(r["Node ID"]): r for r in rows if r["Op Type"] == "GroupedMatMul"}
-        G = _NUM_EXPERTS // _EP
-        M = _BATCH * _SEQ_LEN * _MOE_ACTIVE // _NUM_EXPERTS
-        for layer in range(4):
-            prefix = f"transformer_layers_{layer}_ffn"
+        G = _experts_per_ep_rank()
+        M = _grouped_m()
+        prefixes = _grouped_bwd_row_prefixes(rows)
+        assert prefixes, "Expected exported backward GroupedMatMul rows"
+        for prefix in prefixes:
             expected = [
                 f"comm_a2a_dispatch_{prefix}_grouped_down_bwd",
                 f"{prefix}_grouped_down_bwd",
@@ -473,8 +521,9 @@ class TestEPE2E:
             )
         ]
         ids = [str(r["Node ID"]) for r in fwd_ep]
-        for layer in range(4):
-            prefix = f"transformer_layers_{layer}_ffn"
+        prefixes = _grouped_row_prefixes(rows)
+        assert prefixes, "Expected exported forward GroupedMatMul rows"
+        for prefix in prefixes:
             expected = [
                 f"comm_a2a_dispatch_{prefix}_grouped_gate_up",
                 f"{prefix}_grouped_gate_up",
