@@ -192,6 +192,13 @@ def main() -> None:
         help="Context-parallel degree (default: 1).",
     )
     parser.add_argument(
+        "--tp-extend-ep",
+        action="store_true",
+        default=False,
+        help="Use TP ranks as part of the MoE EP domain in graph capture "
+             "(ETP=1 instead of ETP=TP).",
+    )
+    parser.add_argument(
         "--cp-kind",
         default="none",
         choices=["none", "ulysses", "ring", "hybrid", "compressed"],
@@ -587,6 +594,7 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
         hw_spec=hw,
         parallel=ParallelConfig(
             tp=args.tp, pp=args.pp, ep=args.ep, dp=args.dp, cp=args.cp,
+            tp_extend_ep=args.tp_extend_ep,
         ),
         stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
         quant=quant,
@@ -692,6 +700,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         ep=args.ep,
         dp=args.dp,
         cp=args.cp,
+        tp_extend_ep=args.tp_extend_ep,
         cp_kind=getattr(args, "cp_kind", "ulysses"),
         zero_stage=args.zero_stage,
         optimizer=args.optimizer,

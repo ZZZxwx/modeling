@@ -39,6 +39,7 @@ def estimate_training_from_graphs(
     seq_len: int = 128,
     batch_size: int = 1,
     tp: int = 1, pp: int = 1, ep: int = 1, dp: int = 1, cp: int = 1,
+    tp_extend_ep: bool = False,
     cp_kind: str = "ulysses",
     zero_stage: int = 1,
     optimizer: str = "adam",
@@ -155,7 +156,9 @@ def estimate_training_from_graphs(
     ctx = TransformContext(
         hw_spec=hw_spec,
         model_id=model_id,
-        parallel=ParallelConfig(tp=tp, pp=pp, ep=ep, dp=dp, cp=cp),
+        parallel=ParallelConfig(
+            tp=tp, pp=pp, ep=ep, dp=dp, cp=cp, tp_extend_ep=tp_extend_ep,
+        ),
         training=TrainingConfig(
             optimizer=optimizer,
             zero_stage=zero_stage,
