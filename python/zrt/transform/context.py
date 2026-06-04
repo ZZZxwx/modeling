@@ -31,6 +31,7 @@ class ParallelConfig:
     dp: int = 1
     cp: int = 1
     sp: bool = False
+    tp_extend_ep: bool = False
 
     @property
     def total_devices(self) -> int:
