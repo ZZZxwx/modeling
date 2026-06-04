@@ -17,6 +17,7 @@ from python.zrt.ir.edge import Edge
 from python.zrt.ir.node import OpNode
 from python.zrt.ir.types import TensorMeta, DType
 from python.zrt.transform.base import GraphPass
+from python.zrt.transform.parallel.domains import build_parallel_domains
 
 if TYPE_CHECKING:
     from python.zrt.ir.graph import OpGraph
@@ -155,27 +156,30 @@ class CommInserterPass(GraphPass):
         if not ep_nodes:
             return
 
-        seq_len = g.metadata.get("seq_len", 2048)
-        hidden = g.metadata.get("hidden", 4096)
+        seq_len = g.metadata.get("seq_len", ctx.training.seq_len if ctx.training else 2048)
+        hidden = g.metadata.get("hidden", ctx.training.hidden if ctx.training else 4096)
         dtype_bytes = 2
         micro_batch = ctx.training.micro_batch if ctx.training else 1
         topk = ctx.profile.moe_active if ctx.profile else 8
+        domains = build_parallel_domains(ctx.parallel)
+        seq_local = seq_len // max(1, domains.cp)
 
         # Per-rank participating buffer for one A2A direction. Each rank
         # starts with its local micro-batch tokens and top-k routes; the
         # collective latency model applies the group-size factor, so do not
         # pre-divide this payload by EP.
-        routed_tokens = micro_batch * seq_len * topk
+        routed_tokens = micro_batch * seq_local * topk
         ep_msg_bytes = routed_tokens * hidden * dtype_bytes
+        ep_rank_sample = domains.rank_sample("EP")
 
         dispatch_tensor = TensorMeta.from_shape_dtype(
             "ep_dispatch_hidden",
-            shape=(micro_batch, seq_len, hidden),
+            shape=(micro_batch, seq_local, hidden),
             dtype=DType.BF16,
         )
         combine_tensor = TensorMeta.from_shape_dtype(
             "ep_combine_hidden",
-            shape=(micro_batch, seq_len, hidden),
+            shape=(micro_batch, seq_local, hidden),
             dtype=DType.BF16,
         )
 
@@ -216,7 +220,11 @@ class CommInserterPass(GraphPass):
                     attrs={"group_size": ep, "collective": "all_to_all",
                            "role": "dispatch", "msg_bytes": ep_msg_bytes,
                            "msg_bytes_semantics": "per_a2a_direction",
-                           "dtype_bytes": dtype_bytes},
+                           "dtype_bytes": dtype_bytes,
+                           "comm_group": "EP",
+                           "comm_domain": "MOE_EP",
+                           "comm_bytes": ep_msg_bytes,
+                           "rank_sample": ep_rank_sample},
                     scope=first.scope,
                     layer=first.layer,
                     category="communication",
@@ -235,7 +243,11 @@ class CommInserterPass(GraphPass):
                     attrs={"group_size": ep, "collective": "all_to_all",
                            "role": "combine", "msg_bytes": ep_msg_bytes,
                            "msg_bytes_semantics": "per_a2a_direction",
-                           "dtype_bytes": dtype_bytes},
+                           "dtype_bytes": dtype_bytes,
+                           "comm_group": "EP",
+                           "comm_domain": "MOE_EP",
+                           "comm_bytes": ep_msg_bytes,
+                           "rank_sample": ep_rank_sample},
                     scope=last.scope,
                     layer=last.layer,
                     category="communication",
